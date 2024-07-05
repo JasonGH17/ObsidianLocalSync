@@ -1,134 +1,239 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { createHash } from "crypto";
+import {
+	Plugin,
+	Notice,
+	Modal,
+	App,
+	arrayBufferToBase64,
+	base64ToArrayBuffer,
+} from "obsidian";
+import express from "express";
+import http from "http";
+import dns from "dns";
+import os from "os";
+import cors from "cors";
+import { promisify } from "util";
 
-// Remember to rename these classes and interfaces!
+class SignalDataModal extends Modal {
+	onSubmit: (signalData: string) => void;
 
-interface MyPluginSettings {
-	mySetting: string;
-}
-
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
-}
-
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
-
-	async onload() {
-		await this.loadSettings();
-
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-	}
-
-	onunload() {
-
-	}
-
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-	}
-
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
-}
-
-class SampleModal extends Modal {
-	constructor(app: App) {
+	constructor(app: App, onSubmit: (signalData: string) => void) {
 		super(app);
+		this.onSubmit = onSubmit;
 	}
 
 	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "Enter Signal Data" });
+
+		const inputEl = contentEl.createEl("textarea");
+		inputEl.setAttr("rows", "10");
+		inputEl.setAttr("cols", "50");
+		inputEl.placeholder = "Enter the signal data here...";
+
+		const submitBtn = contentEl.createEl("button", { text: "Connect" });
+		submitBtn.onclick = () => {
+			this.onSubmit(inputEl.value);
+			this.close();
+		};
 	}
 
 	onClose() {
-		const {contentEl} = this;
+		const { contentEl } = this;
 		contentEl.empty();
 	}
 }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+// TODO: Create change selection system in the case where a file sent by the server doesn't match the old hash and the client's file hash doesn't match the old hash
 
-	constructor(app: App, plugin: MyPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
+export default class LocalSyncPlugin extends Plugin {
+	server: http.Server<
+		typeof http.IncomingMessage,
+		typeof http.ServerResponse
+	> | null;
+
+	async onload() {
+		this.addCommand({
+			id: "start-connection",
+			name: "Start P2P Connection",
+			callback: () => {
+				new Notice("Starting sync session.");
+				this.setupPeerConnection();
+			},
+		});
+
+		this.addCommand({
+			id: "connect-peer",
+			name: "Connect to Peer",
+			callback: () => {
+				new SignalDataModal(this.app, (signalData) => {
+					this.connectToPeer(JSON.parse(signalData));
+				}).open();
+			},
+		});
+
+		this.addCommand({
+			id: "close-server",
+			name: "Close P2P server",
+			callback: () => {
+				this.server?.close();
+				new Notice("Closed P2P connection server");
+			},
+		});
 	}
 
-	display(): void {
-		const {containerEl} = this;
+	async onunload() {
+		if (this.server) {
+			this.server.close();
+		}
+	}
 
-		containerEl.empty();
+	async setupPeerConnection() {
+		const server = express();
 
-		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
+		server.use(express.json());
+		server.use(cors());
+
+		server.get("/hashes", async (req, res) => {
+			const hashes = await this.getVaultHashes();
+			const files = [];
+			for (const x of hashes) {
+				const file = this.app.vault.getFileByPath(x.path)!;
+				files.push({
+					path: x.path,
+					hash: x.hash,
+					data: arrayBufferToBase64(
+						await this.app.vault.readBinary(file)
+					),
+				});
+			}
+
+			res.json(files);
+		});
+
+		server.post("/changes", (req, res) => {
+			const files: { path: string; data: string }[] = req.body;
+			files
+				.map(({ path, data }) => ({
+					path,
+					data: base64ToArrayBuffer(data),
+				}))
+				.forEach(({ path, data }) => {
+					const file = this.app.vault.getFileByPath(path);
+					if (file) {
+						this.app.vault.modifyBinary(file, data, {
+							mtime: new Date().getUTCSeconds(),
+						});
+					} else {
+						this.app.vault.createBinary(path, data);
+					}
+				});
+
+			this.saveData({ hashes: this.getVaultHashes() }).then(res.end);
+		});
+
+		const addr = await promisify(dns.lookup)(os.hostname(), { family: 4 });
+		new Notice("Your sync code is: " + addr.address.split(".").last(), 30);
+
+		this.server = server.listen(56780);
+
+		setTimeout(() => {
+			this.server?.close();
+			new Notice("Closed P2P connection server - Reason: 30s Timeout", 6);
+		}, 30000);
+	}
+
+	async getVaultHashes(): Promise<{ path: string; hash: string }[]> {
+		const hashes: { path: string; hash: string }[] = [];
+
+		for (const file of this.app.vault.getFiles()) {
+			const data = await this.app.vault.readBinary(file);
+			hashes.push({
+				path: file.path,
+				hash: createHash("sha1")
+					.update(Buffer.from(data))
+					.digest("base64"),
+			});
+		}
+
+		return hashes;
+	}
+
+	async getPreviousSyncHashes(): Promise<{ path: string; hash: string }[]> {
+		const data = await this.loadData();
+
+		if (data && data.hashes) return data.hashes;
+		else {
+			this.saveData({ hashes: await this.getVaultHashes() }).catch(
+				console.error
+			);
+			return [];
+		}
+	}
+
+	async connectToPeer(code: string) {
+		const addr = await promisify(dns.lookup)(os.hostname(), { family: 4 });
+		const res = await fetch(
+			`http://${addr.address
+				.split(".")
+				.slice(0, -1)
+				.join(".")}.${code}:56780/hashes`,
+			{ method: "GET" }
+		);
+		const newHashes: { path: string; hash: string; data: string }[] =
+			await res.json();
+		const hashes = (await this.getVaultHashes()).map(({ path, hash }) => ({
+			path,
+			hash,
+			done: false,
+		}));
+		const lastSyncHashes = await this.getPreviousSyncHashes();
+		newHashes.forEach(({ path, hash, data }) => {
+			const file = hashes.find((x) => x.path == path);
+			if (
+				file &&
+				file.hash !== hash &&
+				lastSyncHashes.find((x) => x.path == path)?.hash !== hash &&
+				this.app.vault.getFileByPath(path)
+			) {
+				this.app.vault.modifyBinary(
+					this.app.vault.getFileByPath(path)!,
+					base64ToArrayBuffer(data)
+				);
+				file.done = true;
+			} else {
+				this.app.vault.createBinary(path, base64ToArrayBuffer(data));
+			}
+		});
+
+		const newChanges = hashes
+			.filter(({ done }) => !done)
+			.map(({ path }) => path);
+
+		const data: { path: string; data: string }[] = [];
+		for (const path of newChanges) {
+			data.push({
+				path,
+				data: arrayBufferToBase64(
+					await this.app.vault.readBinary(
+						this.app.vault.getFileByPath(path)!
+					)
+				),
+			});
+		}
+
+		await fetch(
+			`http://${addr.address
+				.split(".")
+				.slice(0, -1)
+				.join(".")}.${code}:56780/changes`,
+			{
+				method: "POST",
+				body: JSON.stringify(data),
+				headers: { "Content-Type": "application/json" },
+			}
+		);
+
+		this.saveData({ hashes: await this.getVaultHashes() });
 	}
 }
