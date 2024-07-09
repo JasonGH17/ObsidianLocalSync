@@ -6,6 +6,7 @@ import {
 	App,
 	arrayBufferToBase64,
 	base64ToArrayBuffer,
+	requestUrl,
 } from "obsidian";
 import express from "express";
 import http from "http";
@@ -173,13 +174,13 @@ export default class LocalSyncPlugin extends Plugin {
 
 	async connectToPeer(code: string) {
 		const addr = await promisify(dns.lookup)(os.hostname(), { family: 4 });
-		const res = await fetch(
-			`http://${addr.address
+		const res = await requestUrl({
+			url: `http://${addr.address
 				.split(".")
 				.slice(0, -1)
 				.join(".")}.${code}:56780/hashes`,
-			{ method: "GET" }
-		);
+			method: "GET",
+		});
 		const newHashes: { path: string; hash: string; data: string }[] =
 			await res.json();
 		const hashes = (await this.getVaultHashes()).map(({ path, hash }) => ({
@@ -222,17 +223,15 @@ export default class LocalSyncPlugin extends Plugin {
 			});
 		}
 
-		await fetch(
-			`http://${addr.address
+		await requestUrl({
+			url: `http://${addr.address
 				.split(".")
 				.slice(0, -1)
 				.join(".")}.${code}:56780/changes`,
-			{
-				method: "POST",
-				body: JSON.stringify(data),
-				headers: { "Content-Type": "application/json" },
-			}
-		);
+			method: "POST",
+			body: JSON.stringify(data),
+			headers: { "Content-Type": "application/json" },
+		});
 
 		this.saveData({ hashes: await this.getVaultHashes() });
 	}
